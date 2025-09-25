@@ -1,6 +1,5 @@
 
-import time
-import random, numpy as np, pandas as pd, matplotlib.pyplot as plt
+import random, numpy as np, pandas as pd, matplotlib.pyplot as plt, time
 import torch, torch.nn as nn, torch.nn.functional as F
 
 from torch_geometric.data import Data
@@ -9,10 +8,15 @@ from torch_geometric.nn import GCNConv, global_mean_pool, global_max_pool
 
 from sklearn.preprocessing import StandardScaler
 from sklearn.model_selection import train_test_split
+from sklearn.metrics import r2_score, mean_squared_error
 from sklearn.metrics import r2_score, mean_squared_error, mean_absolute_error
 
 # ---------- toggles ----------
-USE_GRAPH_PHYSICS_TERMS = True 
+USE_GRAPH_PHYSICS_TERMS = True  # set True to append [delta_size, delta_chi] to graph-level features
+
+# ---------- (OPTIONAL) DFT baseline for speedup calc ----------
+# Set to your DFT workflow’s CPU-hour estimate for an equivalent dataset; leave None to skip.
+TOTAL_DFT_CPU_HOURS = None  
 
 # ---------- reproducibility ----------
 SEED = 42
@@ -38,7 +42,6 @@ from matminer.featurizers.composition import ElementProperty
 from pymatgen.core.composition import Composition
 from pymatgen.core.periodic_table import Element as PymatElement
 
-# graph-level Magpie over composition
 ep = ElementProperty.from_preset('magpie')
 df['composition'] = df['composition_str'].apply(Composition)
 df = ep.featurize_dataframe(df, col_id='composition')
@@ -61,7 +64,7 @@ IDX_MEND = idx_or_none('MendeleevNumber')
 node_feats_list, graph_feats_list, targets = [], [], []
 edge_attr_raw_list, edge_type_id_list = [], []
 
-# unordered chemical pair -> id (0..9) by canonical indices, fixed across all graphs
+# unordered chemical pair -> id (0..9)
 pair2id, id2pair = {}, {}
 pid = 0
 for i in range(5):
@@ -69,29 +72,21 @@ for i in range(5):
         pair2id[(i, j)] = pid
         id2pair[pid] = (i, j)
         pid += 1
-NUM_EDGE_TYPES = pid  # 10
-EDGE_FEAT_DIM = 6    # [frac_i*frac_j, |Δfrac|, |ΔZ|, |ΔEN|, |Δrcov|, |ΔMendeleev|]
+NUM_EDGE_TYPES = pid 
+EDGE_FEAT_DIM = 6    
 
 def make_undirected_edge_index(num_nodes: int):
-    """Return i<j edges once (undirected pairs)."""
     src, dst = [], []
     for i in range(num_nodes):
         for j in range(i+1, num_nodes):
             src.append(i); dst.append(j)
-    return torch.tensor([src, dst], dtype=torch.long)  
+    return torch.tensor([src, dst], dtype=torch.long)
 
 def compute_edge_features_for_nodes(nodes_np, node_canon_ids):
-    """
-    nodes_np[i] = [frac, Z] + magpie_feats   (no host, no pure_vfe)
-    node_canon_ids[i] = canonical element index 0..4
-    returns: edge_attr_undirected (nC2, EDGE_FEAT_DIM), edge_type_id (nC2,)
-    """
     n = nodes_np.shape[0]
-
-    # handle pure-metal (n==1) cleanly with shape-safe arrays
     if n < 2:
-        edge_attr_und = np.zeros((0, EDGE_FEAT_DIM), dtype=float) 
-        edge_type_und = np.zeros((0,), dtype=int)                   
+        edge_attr_und = np.zeros((0, EDGE_FEAT_DIM), dtype=float)
+        edge_type_und = np.zeros((0,), dtype=int)
         return edge_attr_und, edge_type_und
 
     undirected = [(i, j) for i in range(n) for j in range(i+1, n)]
@@ -105,26 +100,23 @@ def compute_edge_features_for_nodes(nodes_np, node_canon_ids):
         ni, nj = nodes_np[i], nodes_np[j]
         frac_i, Z_i = float(ni[0]), float(ni[1])
         frac_j, Z_j = float(nj[0]), float(nj[1])
-
         feat = [
-            frac_i * frac_j,                         # composition interaction
-            abs(frac_i - frac_j),                    # imbalance
-            abs(Z_i - Z_j),                          # atomic number difference
-            abs(mag_at(IDX_EN,   ni) - mag_at(IDX_EN,   nj)),  # EN mismatch
-            abs(mag_at(IDX_RCOV, ni) - mag_at(IDX_RCOV, nj)),  # radius mismatch
-            abs(mag_at(IDX_MEND, ni) - mag_at(IDX_MEND, nj)),  # Mendeleev distance
+            frac_i * frac_j,
+            abs(frac_i - frac_j),
+            abs(Z_i - Z_j),
+            abs(mag_at(IDX_EN,   ni) - mag_at(IDX_EN,   nj)),
+            abs(mag_at(IDX_RCOV, ni) - mag_at(IDX_RCOV, nj)),
+            abs(mag_at(IDX_MEND, ni) - mag_at(IDX_MEND, nj)),
         ]
         feats_und.append(feat)
-
         ci, cj = node_canon_ids[i], node_canon_ids[j]
         types_und.append(pair2id[(min(ci, cj), max(ci, cj))])
 
-    edge_attr_und = np.array(feats_und, dtype=float)   
-    edge_type_und = np.array(types_und, dtype=int)     
+    edge_attr_und = np.array(feats_und, dtype=float)
+    edge_type_und = np.array(types_und, dtype=int)
     return edge_attr_und, edge_type_und
 
 def physics_graph_terms(nodes_np):
-    """Return [delta_size, delta_chi] via composition-weighted spreads using node Magpie (rcov, EN)."""
     def mag_at(idx, vec):
         if idx is None: return 0.0
         return float(vec[2 + idx])
@@ -152,7 +144,7 @@ for _, row in df.iterrows():
     for el in present:
         frac = float(row.get(f'Comp_{el}', 0.0))
         Z = float(PymatElement(el).Z)
-        mag = el_featurizer.featurize(Composition(el))  # list of magpie_node_cols
+        mag = el_featurizer.featurize(Composition(el))
         nodes.append([frac, Z] + list(map(float, mag)))
         node_canon_ids.append(el2idx[el])
     nodes_np = np.array(nodes, dtype=float)
@@ -173,11 +165,11 @@ for _, row in df.iterrows():
 
     # undirected edges & types
     e_attr_und, e_type_und = compute_edge_features_for_nodes(nodes_np, node_canon_ids)
-    edge_attr_raw_list.append(e_attr_und)   # (nC2, 6) or (0,6) for single-node graphs
-    edge_type_id_list.append(e_type_und)    # (nC2,) or (0,)
+    edge_attr_raw_list.append(e_attr_und)
+    edge_type_id_list.append(e_type_und)
 
-targets     = np.array(targets, dtype=float)           # (N, 1)
-graph_feats = np.array(graph_feats_list, dtype=float)  # (N, 132 + 5 [+2 if physics])
+targets     = np.array(targets, dtype=float)           
+graph_feats = np.array(graph_feats_list, dtype=float)  
 
 # ---------- 4) standardize ----------
 # Node features
@@ -192,7 +184,7 @@ graph_feats_scaled = scaler_graph.transform(graph_feats)
 
 # Edge features (UNDIRECTED)
 if len(edge_attr_raw_list) > 0:
-    all_edges = np.vstack(edge_attr_raw_list)       
+    all_edges = np.vstack(edge_attr_raw_list)
     edge_dim = all_edges.shape[1] if all_edges.size > 0 else EDGE_FEAT_DIM
     if all_edges.size > 0:
         scaler_edge = StandardScaler().fit(all_edges)
@@ -215,32 +207,25 @@ print("Graphs by node count:", num_by_nodes)
 # ---------- 5) build PyG graphs (variable size, undirected→directed for message passing) ----------
 graphs = []
 for i in range(N):
-    x     = torch.tensor(node_feats_scaled[i], dtype=torch.float32)     
-    gfeat = torch.tensor(graph_feats_scaled[i], dtype=torch.float32)    
-    y     = torch.tensor(targets_std[i],      dtype=torch.float32)       
+    x     = torch.tensor(node_feats_scaled[i], dtype=torch.float32)
+    gfeat = torch.tensor(graph_feats_scaled[i], dtype=torch.float32)
+    y     = torch.tensor(targets_std[i],      dtype=torch.float32)
 
-    # UNDIRECTED pairs (i<j) → mirror to both directions for message passing
-    ei_und = make_undirected_edge_index(x.size(0))                       
-
+    ei_und = make_undirected_edge_index(x.size(0))
     if ei_und.numel() == 0:
-        # single-node graph: leave edge_index empty; GCNConv(add_self_loops=True) will add self-loop internally
-        edge_index = torch.empty((2,0), dtype=torch.long)                
-        eattr = torch.zeros((0, edge_dim), dtype=torch.float32)          
-        etype = torch.zeros((0,), dtype=torch.long)                      
+        edge_index = torch.empty((2,0), dtype=torch.long)
+        eattr = torch.zeros((0, edge_dim), dtype=torch.float32)
+        etype = torch.zeros((0,), dtype=torch.long)
     else:
-        edge_index = torch.cat([ei_und, ei_und.flip(0)], dim=1)          
-        eattr_und = torch.tensor(edge_attr_scaled_und[i], dtype=torch.float32)  
-        etype_und = torch.tensor(edge_type_id_list[i],    dtype=torch.long)     
+        edge_index = torch.cat([ei_und, ei_und.flip(0)], dim=1)
+        eattr_und = torch.tensor(edge_attr_scaled_und[i], dtype=torch.float32)
+        etype_und = torch.tensor(edge_type_id_list[i],    dtype=torch.long)
         eattr = torch.vstack([eattr_und, eattr_und]) if eattr_und.numel() > 0 else torch.zeros((0, edge_dim))
         etype = torch.hstack([etype_und, etype_und]) if etype_und.numel() > 0 else torch.zeros((0,), dtype=torch.long)
 
     data  = Data(
-        x=x,
-        edge_index=edge_index,
-        edge_attr=eattr,        
-        edge_type_id=etype,     
-        graph_feat=gfeat,
-        y=y
+        x=x, edge_index=edge_index, edge_attr=eattr, edge_type_id=etype,
+        graph_feat=gfeat, y=y
     )
     graphs.append(data)
 
@@ -254,7 +239,6 @@ test_loader  = DataLoader([graphs[i] for i in test_idx],  batch_size=16, shuffle
 class UltraEnhancedGNN_Physics(nn.Module):
     """
     Non-attention GNN using GCNConv (ignores edge_attr; uses per-pair gates as edge_weight).
-    Keeps per-pair gates, SE block, residual, and same fusion head.
     """
     def __init__(self, node_in, graph_in, edge_dim, num_edge_types,
                  hidden=256, dropout=0.05, l1_gate=1e-4):
@@ -290,7 +274,6 @@ class UltraEnhancedGNN_Physics(nn.Module):
         self.edge_type_logit = nn.Parameter(torch.zeros(num_edge_types))
 
     def _edge_weights(self, edge_type_id):
-        # handle empty edge sets gracefully
         if edge_type_id.numel() == 0:
             return None
         gates = torch.sigmoid(self.edge_type_logit)          
@@ -332,7 +315,7 @@ class UltraEnhancedGNN_Physics(nn.Module):
         self._gate_l1 = torch.mean(torch.abs(torch.sigmoid(self.edge_type_logit)))
         return out
 
-# ---------- 8) training ----------
+# ---------- 8) training (with timing) ----------
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 model = UltraEnhancedGNN_Physics(
     node_in=node_dim,
@@ -373,10 +356,17 @@ def eval_epoch(loader):
 
 best_val = float('inf'); best_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
 wait, PATIENCE = 0, 60
+
+epoch_times = []
+train_start = time.perf_counter()
+
 for epoch in range(1, 301):
+    t0 = time.perf_counter()
     tr = train_epoch()
     va,_,_ = eval_epoch(test_loader)
     scheduler.step(va)
+    epoch_times.append(time.perf_counter() - t0)
+
     improved = va < best_val - 1e-6
     if improved:
         best_val = va; wait = 0
@@ -384,15 +374,39 @@ for epoch in range(1, 301):
     else:
         wait += 1
     if epoch % 20 == 0 or epoch == 1:
-        print(f"Epoch {epoch:03d} | Train {tr:.6f} | Val {va:.6f} | LR {optimizer.param_groups[0]['lr']:.2e}")
+        print(f"Epoch {epoch:03d} | Train {tr:.6f} | Val {va:.6f} | LR {optimizer.param_groups[0]['lr']:.2e} | epoch {epoch_times[-1]:.2f}s")
     if wait >= PATIENCE:
         print("Early stopping."); break
+
+total_train_s = time.perf_counter() - train_start
+avg_epoch_s = np.mean(epoch_times) if epoch_times else float('nan')
+print(f"\nTraining time: {total_train_s:.2f}s total | {avg_epoch_s:.2f}s/epoch (avg over {len(epoch_times)} epochs)")
 
 # load best
 model.load_state_dict({k: v.to(device) for k, v in best_state.items()})
 
-# ---------- 9) final evaluation ----------
+# ---------- 9) final evaluation + inference timing ----------
+@torch.no_grad()
+def timed_inference(loader):
+    model.eval()
+    # warm-up
+    for _ in range(2):
+        for data in loader:
+            data = data.to(device); _ = model(data)
+        break
+    # timed
+    n_graphs = 0
+    t0 = time.perf_counter()
+    for data in loader:
+        n_graphs += data.num_graphs
+        data = data.to(device)
+        _ = model(data)
+    dt = time.perf_counter() - t0
+    return dt, n_graphs
+
 val_loss, preds, trues = eval_epoch(test_loader)
+infer_s, n_eval = timed_inference(test_loader)
+
 pred_phys  = scaler_y.inverse_transform(preds)
 trues_phys = scaler_y.inverse_transform(trues)
 
@@ -401,55 +415,25 @@ r2   = r2_score(trues_phys.flatten(), pred_phys.flatten())
 mae  = mean_absolute_error(trues_phys.flatten(), pred_phys.flatten())
 print(f"\nTest RMSE: {rmse:.6f} eV | Test MAE: {mae:.6f} eV | Test R²: {r2:.6f}")
 
+throughput = n_eval / infer_s if infer_s > 0 else float('inf')
+per_graph_ms = 1000.0 * infer_s / n_eval if n_eval > 0 else float('nan')
+print(f"Inference: {infer_s:.3f}s over {n_eval} graphs | ~{throughput:.1f} graphs/s | ~{per_graph_ms:.2f} ms/graph")
+
+# ---------- (OPTIONAL) speedup vs. DFT ----------
+if TOTAL_DFT_CPU_HOURS is not None:
+    dft_seconds = TOTAL_DFT_CPU_HOURS * 3600.0
+    speedup_train_only = dft_seconds / total_train_s if total_train_s > 0 else float('inf')
+    speedup_train_plus_eval = dft_seconds / (total_train_s + infer_s) if (total_train_s + infer_s) > 0 else float('inf')
+    print(f"\nEstimated speedup vs. DFT baseline:")
+    print(f"  vs. training only:      ~{speedup_train_only:,.0f}×")
+    print(f"  vs. train + evaluation: ~{speedup_train_plus_eval:,.0f}×")
+    print("  (Set TOTAL_DFT_CPU_HOURS to your workflow’s CPU-hour estimate.)")
+
 # ---------- parity plot ----------
 plt.figure(figsize=(6,6))
-plt.scatter(trues_phys.flatten(), pred_phys.flatten(), alpha=0.6, edgecolor='k', linewidths=0.4)
+plt.scatter(trues_phys.flatten(), pred_phys.flatten(), alpha=0.6, edgecolor='k', linewidth=0.4)
 mn, mx = trues_phys.min(), trues_phys.max()
 plt.plot([mn, mx], [mn, mx], 'r--', linewidth=1.2)
 plt.xlabel('Actual VFE (eV)'); plt.ylabel('Predicted VFE (eV)')
 plt.title('2-layer GCN, undirected pairs→directed, no pure-VFE input')
 plt.grid(True, ls='--', alpha=0.5); plt.tight_layout(); plt.show()
-
-# ---------- 10) inference timing & DFT→ML speed-up ----------
-# Set this to your measured median DFT wall-time for a single VFE (hours)
-T_DFT_HOURS = 2.0   # e.g., 2 hours per VFE (pristine + vacancy relaxations)
-
-# Cache test batches on device so we're only timing the forward pass
-test_batches = []
-for data in DataLoader([graphs[i] for i in test_idx], batch_size=16, shuffle=False):
-    test_batches.append(data.to(device))
-
-@torch.no_grad()
-def median_inference_time_per_graph_s(batches, repeats=7, warmup=2):
-    # Warmup to stabilize clocks/caches
-    for _ in range(warmup):
-        for b in batches:
-            _ = model(b)
-
-    times = []
-    for _ in range(repeats):
-        if device.type == "cuda":
-            torch.cuda.synchronize()
-        t0 = time.perf_counter()
-        for b in batches:
-            _ = model(b)
-        if device.type == "cuda":
-            torch.cuda.synchronize()
-        t1 = time.perf_counter()
-
-        n_graphs = sum(int(b.num_graphs) for b in batches)
-        times.append((t1 - t0) / max(n_graphs, 1))
-
-    return float(np.median(times))
-
-t_per_graph = median_inference_time_per_graph_s(test_batches)  
-throughput = 1.0 / t_per_graph                                 
-
-t_dft_s = T_DFT_HOURS * 3600.0
-speedup = t_dft_s / t_per_graph
-
-print("\n=== Inference Timing (GCN) ===")
-print(f"Median inference time per composition: {t_per_graph*1e3:.3f} ms")
-print(f"Throughput: {throughput:.1f} comps/s")
-print(f"Assumed DFT median per VFE: {T_DFT_HOURS:.2f} h ({t_dft_s:.0f} s)")
-print(f"Estimated DFT→ML speed-up: {speedup:,.0f}×")
