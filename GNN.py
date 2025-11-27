@@ -1,4 +1,3 @@
-
 import random, numpy as np, pandas as pd, matplotlib.pyplot as plt, time
 import torch, torch.nn as nn, torch.nn.functional as F
 
@@ -11,19 +10,18 @@ from sklearn.model_selection import train_test_split
 from sklearn.metrics import r2_score, mean_squared_error
 from sklearn.metrics import r2_score, mean_squared_error, mean_absolute_error
 
-# ---------- toggles ----------
-USE_GRAPH_PHYSICS_TERMS = True  # set True to append [delta_size, delta_chi] to graph-level features
 
-# ---------- (OPTIONAL) DFT baseline for speedup calc ----------
-# Set to your DFT workflow’s CPU-hour estimate for an equivalent dataset; leave None to skip.
+USE_GRAPH_PHYSICS_TERMS = True  
+
+
 TOTAL_DFT_CPU_HOURS = None  
 
-# ---------- reproducibility ----------
+
 SEED = 42
 random.seed(SEED); np.random.seed(SEED)
 torch.manual_seed(SEED); torch.cuda.manual_seed_all(SEED)
 
-# ---------- 1) load data ----------
+
 df = pd.read_csv('vfe_dataset_with_pure.csv')
 elements = ['Mo', 'Nb', 'Ta', 'V', 'W']
 el2idx = {el:i for i,el in enumerate(elements)}  
@@ -37,7 +35,7 @@ def row_to_formula(row):
 
 df['composition_str'] = df.apply(row_to_formula, axis=1)
 
-# ---------- 2) matminer featurization (graph-level Magpie) ----------
+
 from matminer.featurizers.composition import ElementProperty
 from pymatgen.core.composition import Composition
 from pymatgen.core.periodic_table import Element as PymatElement
@@ -60,7 +58,7 @@ IDX_EN   = idx_or_none('Electronegativity')
 IDX_RCOV = idx_or_none('CovalentRadius')
 IDX_MEND = idx_or_none('MendeleevNumber')
 
-# ---------- 3) build node, edge, graph features ----------
+
 node_feats_list, graph_feats_list, targets = [], [], []
 edge_attr_raw_list, edge_type_id_list = [], []
 
@@ -171,7 +169,7 @@ for _, row in df.iterrows():
 targets     = np.array(targets, dtype=float)           
 graph_feats = np.array(graph_feats_list, dtype=float)  
 
-# ---------- 4) standardize ----------
+
 # Node features
 all_nodes = np.vstack(node_feats_list)  # (sum_nodes, node_dim)
 node_dim = all_nodes.shape[1]
@@ -204,7 +202,7 @@ print(f"Built {N} graphs | node_dim={node_dim} | undirected edge_dim={edge_dim} 
 print(f"Graph_feats dim: {graph_feats_scaled.shape[1]} (Magpie {len(magpie_cols)} + Host 5{' + Phys 2' if USE_GRAPH_PHYSICS_TERMS else ''})")
 print("Graphs by node count:", num_by_nodes)
 
-# ---------- 5) build PyG graphs (variable size, undirected→directed for message passing) ----------
+
 graphs = []
 for i in range(N):
     x     = torch.tensor(node_feats_scaled[i], dtype=torch.float32)
@@ -229,13 +227,12 @@ for i in range(N):
     )
     graphs.append(data)
 
-# ---------- 6) split & loaders ----------
 train_idx, test_idx = train_test_split(range(N), test_size=0.2, random_state=SEED)
 gen = torch.Generator().manual_seed(SEED)
 train_loader = DataLoader([graphs[i] for i in train_idx], batch_size=16, shuffle=True, generator=gen, num_workers=0)
 test_loader  = DataLoader([graphs[i] for i in test_idx],  batch_size=16, shuffle=False, generator=gen, num_workers=0)
 
-# ---------- 7) model (TWO GNN layers, GCNConv) ----------
+
 class UltraEnhancedGNN_Physics(nn.Module):
     """
     Non-attention GNN using GCNConv (ignores edge_attr; uses per-pair gates as edge_weight).
@@ -315,7 +312,7 @@ class UltraEnhancedGNN_Physics(nn.Module):
         self._gate_l1 = torch.mean(torch.abs(torch.sigmoid(self.edge_type_logit)))
         return out
 
-# ---------- 8) training (with timing) ----------
+
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 model = UltraEnhancedGNN_Physics(
     node_in=node_dim,
@@ -382,19 +379,22 @@ total_train_s = time.perf_counter() - train_start
 avg_epoch_s = np.mean(epoch_times) if epoch_times else float('nan')
 print(f"\nTraining time: {total_train_s:.2f}s total | {avg_epoch_s:.2f}s/epoch (avg over {len(epoch_times)} epochs)")
 
-# load best
+
 model.load_state_dict({k: v.to(device) for k, v in best_state.items()})
 
-# ---------- 9) final evaluation + inference timing ----------
+
+bn_layers = [m for m in model.modules() if isinstance(m, nn.BatchNorm1d)]
+
+
 @torch.no_grad()
 def timed_inference(loader):
     model.eval()
-    # warm-up
+    
     for _ in range(2):
         for data in loader:
             data = data.to(device); _ = model(data)
         break
-    # timed
+    
     n_graphs = 0
     t0 = time.perf_counter()
     for data in loader:
@@ -419,7 +419,78 @@ throughput = n_eval / infer_s if infer_s > 0 else float('inf')
 per_graph_ms = 1000.0 * infer_s / n_eval if n_eval > 0 else float('nan')
 print(f"Inference: {infer_s:.3f}s over {n_eval} graphs | ~{throughput:.1f} graphs/s | ~{per_graph_ms:.2f} ms/graph")
 
-# ---------- (OPTIONAL) speedup vs. DFT ----------
+
+
+@torch.no_grad()
+def mc_dropout_predictions(loader, T=50):
+    """
+    Run T stochastic forward passes with dropout active to estimate
+    per-sample mean prediction and 1σ uncertainty.
+    """
+    all_samples = []
+    trues_std = None
+
+    for t in range(T):
+        # Enable dropout but keep BatchNorm in eval mode
+        model.train()
+        for bn in bn_layers:
+            bn.eval()
+
+        preds_t = []
+        trues_t = []
+        for data in loader:
+            data = data.to(device)
+            out = model(data).squeeze()
+            preds_t.append(out.detach().cpu().numpy().reshape(-1, 1))
+            trues_t.append(data.y.detach().cpu().numpy().reshape(-1, 1))
+
+        preds_t = np.vstack(preds_t)
+        if trues_std is None:
+            trues_std = np.vstack(trues_t)
+
+        all_samples.append(preds_t)
+
+    model.eval()
+    samples = np.stack(all_samples, axis=0)  # (T, N, 1)
+    return samples, trues_std
+
+T_MC = 50
+mc_samples_std, trues_std = mc_dropout_predictions(test_loader, T=T_MC)
+
+
+mean_std = mc_samples_std.mean(axis=0)          # (N, 1)
+std_std  = mc_samples_std.std(axis=0, ddof=0)   # (N, 1)
+
+
+trues_phys_u       = scaler_y.inverse_transform(trues_std)
+pred_phys_mean_u   = scaler_y.inverse_transform(mean_std)
+pred_phys_std_u    = std_std * scaler_y.scale_[0]
+
+abs_errors = np.abs(trues_phys_u.flatten() - pred_phys_mean_u.flatten())
+uncert     = pred_phys_std_u.flatten()
+
+mean_unc   = uncert.mean()
+median_unc = np.median(uncert)
+coverage_1sigma = np.mean(abs_errors <= uncert)
+coverage_2sigma = np.mean(abs_errors <= 2.0 * uncert)
+
+print("\n=== Uncertainty metrics (GCN, MC dropout) ===")
+print(f"Mean predicted 1σ uncertainty: {mean_unc:.4f} eV")
+print(f"Median predicted 1σ uncertainty: {median_unc:.4f} eV")
+print(f"Fraction of test points within ±1σ: {coverage_1sigma:.3f}")
+print(f"Fraction of test points within ±2σ: {coverage_2sigma:.3f}")
+
+
+uncert_df = pd.DataFrame({
+    'True_VFE_eV': trues_phys_u.flatten(),
+    'Pred_VFE_MC_Mean_eV': pred_phys_mean_u.flatten(),
+    'Pred_VFE_MC_Std1_eV': uncert,
+    'Abs_Error_eV': abs_errors
+})
+uncert_df.to_csv('gcn_mc_dropout_uncertainty_results.csv', index=False)
+print("\nSaved MC-dropout uncertainty results to 'gcn_mc_dropout_uncertainty_results.csv'.")
+
+
 if TOTAL_DFT_CPU_HOURS is not None:
     dft_seconds = TOTAL_DFT_CPU_HOURS * 3600.0
     speedup_train_only = dft_seconds / total_train_s if total_train_s > 0 else float('inf')
@@ -429,11 +500,48 @@ if TOTAL_DFT_CPU_HOURS is not None:
     print(f"  vs. train + evaluation: ~{speedup_train_plus_eval:,.0f}×")
     print("  (Set TOTAL_DFT_CPU_HOURS to your workflow’s CPU-hour estimate.)")
 
-# ---------- parity plot ----------
-plt.figure(figsize=(6,6))
-plt.scatter(trues_phys.flatten(), pred_phys.flatten(), alpha=0.6, edgecolor='k', linewidth=0.4)
+
+fig, ax = plt.subplots(figsize=(8, 8), dpi=300)
+
+
+ax.scatter(
+    trues_phys.flatten(),
+    pred_phys.flatten(),
+    alpha=0.6,
+    edgecolor='k',
+    linewidth=0.4,
+    label='Predicted'
+)
 mn, mx = trues_phys.min(), trues_phys.max()
-plt.plot([mn, mx], [mn, mx], 'r--', linewidth=1.2)
-plt.xlabel('Actual VFE (eV)'); plt.ylabel('Predicted VFE (eV)')
-plt.title('2-layer GCN, undirected pairs→directed, no pure-VFE input')
-plt.grid(True, ls='--', alpha=0.5); plt.tight_layout(); plt.show()
+ax.plot([mn, mx], [mn, mx], 'r--', linewidth=1.2, label='Parity')
+
+
+ax.set_xlabel('Actual VFE (eV)', fontsize=24)
+ax.set_ylabel('Predicted VFE (eV)', fontsize=24)
+
+
+ax.tick_params(axis='both', labelsize=20)
+
+
+ax.legend(fontsize=20, loc='upper left', markerscale=1.3)
+
+
+ax.grid(False)
+
+
+ax.text(
+    0.95, 0.05,
+    rf'$R^2 = {r2:.3f}$',
+    transform=ax.transAxes,
+    ha='right', va='bottom',
+    fontsize=20,
+    bbox=dict(facecolor='white', edgecolor='black',
+              boxstyle='round', alpha=0.9)
+)
+
+fig.tight_layout()
+
+
+fig.savefig('gCN_parity_plot.png', dpi=300, bbox_inches='tight')
+
+plt.show()
