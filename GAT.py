@@ -9,20 +9,17 @@ from sklearn.preprocessing import StandardScaler
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import r2_score, mean_squared_error, mean_absolute_error  # <-- added
 
-# ---------- toggles ----------
+
 USE_GRAPH_PHYSICS_TERMS = True  # set True to append [delta_size, delta_chi] to graph-level features
 
-# ---------- (OPTIONAL) DFT baseline for speedup calc ----------
-# Set this to your best estimate of the total CPU-hours your DFT workflow would take
-# for an equivalent dataset/training run. If left as None, speedup won't be reported.
 TOTAL_DFT_CPU_HOURS = None  # e.g., 750.0
 
-# ---------- reproducibility ----------
+
 SEED = 42
 random.seed(SEED); np.random.seed(SEED)
 torch.manual_seed(SEED); torch.cuda.manual_seed_all(SEED)
 
-# ---------- 1) load data ----------
+
 df = pd.read_csv('vfe_dataset_with_pure.csv')
 elements = ['Mo', 'Nb', 'Ta', 'V', 'W']
 el2idx = {el:i for i,el in enumerate(elements)}  # canonical indices 0..4
@@ -36,18 +33,18 @@ def row_to_formula(row):
 
 df['composition_str'] = df.apply(row_to_formula, axis=1)
 
-# ---------- 2) matminer featurization (graph-level Magpie) ----------
+
 from matminer.featurizers.composition import ElementProperty
 from pymatgen.core.composition import Composition
 from pymatgen.core.periodic_table import Element as PymatElement
 
-# graph-level Magpie over composition
+
 ep = ElementProperty.from_preset('magpie')
 df['composition'] = df['composition_str'].apply(Composition)
 df = ep.featurize_dataframe(df, col_id='composition')
 magpie_cols = ep.feature_labels()
 
-# node-level Magpie (pure element descriptors)
+
 el_featurizer = ElementProperty.from_preset("magpie")
 magpie_node_cols = el_featurizer.feature_labels()
 print("Element-wise Magpie node feature length:", len(magpie_node_cols))
@@ -60,7 +57,7 @@ IDX_EN   = idx_or_none('Electronegativity')
 IDX_RCOV = idx_or_none('CovalentRadius')
 IDX_MEND = idx_or_none('MendeleevNumber')
 
-# ---------- 3) build node, edge, graph features ----------
+
 node_feats_list, graph_feats_list, targets = [], [], []
 edge_attr_raw_list, edge_type_id_list = [], []
 
@@ -91,7 +88,7 @@ def compute_edge_features_for_nodes(nodes_np, node_canon_ids):
     """
     n = nodes_np.shape[0]
 
-    # --- handle pure-metal (n == 1) cleanly with shape-safe arrays ---
+  
     if n < 2:
         edge_attr_und = np.zeros((0, EDGE_FEAT_DIM), dtype=float)  
         edge_type_und = np.zeros((0,), dtype=int)                  
@@ -141,7 +138,7 @@ def physics_graph_terms(nodes_np):
     delta_chi  = np.sqrt(np.sum(fracs * (en - chibar)**2))
     return np.array([delta_size, delta_chi], dtype=float)
 
-# Build samples
+
 num_by_nodes = {k:0 for k in range(1,6)}
 for _, row in df.iterrows():
     # present elements for this composition
@@ -150,7 +147,7 @@ for _, row in df.iterrows():
         continue  # skip malformed rows
     num_by_nodes[len(present)] += 1
 
-    # nodes: [frac, Z] + pure-element magpie (NO host, NO pure_VFE)
+    
     nodes = []
     node_canon_ids = []
     for el in present:
@@ -162,7 +159,7 @@ for _, row in df.iterrows():
     nodes_np = np.array(nodes, dtype=float)
     node_feats_list.append(nodes_np)
 
-    # graph-level features: Magpie(comp) + Host vector (order Mo,Nb,Ta,V,W) + optional physics terms
+   
     host_vec = np.array([float(row.get(f'Host_{el}', 0.0)) for el in elements], dtype=float)
     gfeat_base = row[magpie_cols].values.astype(float).flatten()
     if USE_GRAPH_PHYSICS_TERMS:
@@ -172,10 +169,10 @@ for _, row in df.iterrows():
         gfeat = np.concatenate([gfeat_base, host_vec], axis=0)
     graph_feats_list.append(gfeat)
 
-    # target (standardize later). Pure metals are treated same as alloys (graph with one node).
+   
     targets.append([float(row['Alloy_VFE'])])
 
-    # undirected edges & edge types by chemical pair (shape-safe for n<2 handled inside)
+   
     e_attr_und, e_type_und = compute_edge_features_for_nodes(nodes_np, node_canon_ids)
     edge_attr_raw_list.append(e_attr_und)   # store UNDIRECTED features (nC2, 6) or (0,6)
     edge_type_id_list.append(e_type_und)    # store UNDIRECTED types (nC2,) or (0,)
@@ -183,7 +180,7 @@ for _, row in df.iterrows():
 targets     = np.array(targets, dtype=float)           # (N, 1)
 graph_feats = np.array(graph_feats_list, dtype=float)  # (N, 132 + 5 [+2 if physics])
 
-# ---------- 4) standardize ----------
+
 # Node features: variable # of nodes → concatenate all
 all_nodes = np.vstack(node_feats_list)  # (sum_nodes, node_dim)
 node_dim = all_nodes.shape[1]
@@ -207,7 +204,7 @@ else:
     edge_dim = EDGE_FEAT_DIM
     edge_attr_scaled_und = edge_attr_raw_list
 
-# Target
+
 scaler_y = StandardScaler().fit(targets)
 targets_std = scaler_y.transform(targets)
 
@@ -216,7 +213,7 @@ print(f"Built {N} graphs | node_dim={node_dim} | undirected edge_dim={edge_dim} 
 print(f"Graph_feats dim: {graph_feats_scaled.shape[1]} (Magpie {len(magpie_cols)} + Host 5{' + Phys 2' if USE_GRAPH_PHYSICS_TERMS else ''})")
 print("Graphs by node count:", num_by_nodes)
 
-# ---------- 5) build PyG graphs (variable size, undirected→directed for message passing) ----------
+
 graphs = []
 for i in range(N):
     x     = torch.tensor(node_feats_scaled[i], dtype=torch.float32)      
@@ -231,9 +228,9 @@ for i in range(N):
         eattr = torch.zeros((1, edge_dim), dtype=torch.float32)          
         etype = torch.tensor([0], dtype=torch.long)                      
     else:
-        # Mirror undirected → both directions
+       
         edge_index = torch.cat([ei_und, ei_und.flip(0)], dim=1)         
-        # Duplicate attrs/types to match the directed edges
+        
         eattr_und = torch.tensor(edge_attr_scaled_und[i], dtype=torch.float32)  # (nC2, edge_dim) or (0, edge_dim)
         etype_und = torch.tensor(edge_type_id_list[i],    dtype=torch.long)     # (nC2,) or (0,)
         eattr = torch.vstack([eattr_und, eattr_und]) if eattr_und.numel() > 0 else torch.zeros((0, edge_dim))
@@ -249,35 +246,35 @@ for i in range(N):
     )
     graphs.append(data)
 
-# ---------- 6) split & loaders ----------
+
 train_idx, test_idx = train_test_split(range(N), test_size=0.2, random_state=SEED)
 gen = torch.Generator().manual_seed(SEED)
 train_loader = DataLoader([graphs[i] for i in train_idx], batch_size=16, shuffle=True, generator=gen, num_workers=0)
 test_loader  = DataLoader([graphs[i] for i in test_idx],  batch_size=16, shuffle=False, generator=gen, num_workers=0)
 
-# ---------- 7) model (TWO GAT layers) ----------
+
 class UltraEnhancedGAT_Physics(nn.Module):
     def __init__(self, node_in, graph_in, edge_dim, num_edge_types, hidden=256, heads=4, dropout=0.05, l1_gate=1e-4):
         super().__init__()
         self.l1_gate = l1_gate
         self.dropout = dropout
 
-        # First GAT layer (heads=4 → hidden*heads output)
+      
         self.gat1 = GATConv(node_in, hidden, heads=heads, concat=True,  edge_dim=edge_dim, add_self_loops=False)
         self.bn1  = nn.BatchNorm1d(hidden * heads)
 
-        # Second GAT layer (heads=1 → hidden output)
+  
         self.gat2 = GATConv(hidden * heads, hidden, heads=1, concat=False, edge_dim=edge_dim, add_self_loops=False)
         self.bn2  = nn.BatchNorm1d(hidden)
 
-        # Squeeze–Excitation & residual projection
+       
         self.se = nn.Sequential(nn.Linear(hidden, hidden//2), nn.ReLU(), nn.Linear(hidden//2, hidden), nn.Sigmoid())
         self.skip_proj = nn.Linear(hidden * heads, hidden)
 
-        # Graph-level stream
+       
         self.lin_graph = nn.Linear(graph_in, hidden)
 
-        # Fusion head
+        
         self.final = nn.Sequential(
             nn.Linear(hidden*4, hidden),
             nn.ReLU(),
@@ -285,7 +282,7 @@ class UltraEnhancedGAT_Physics(nn.Module):
             nn.Linear(hidden, 1)
         )
 
-        # Learnable per-element-pair gates (10 scalars: sigmoid ∈ [0,1])
+        
         self.edge_type_logit = nn.Parameter(torch.zeros(num_edge_types))
 
     def _gate_edges(self, edge_attr, edge_type_id):
@@ -299,35 +296,35 @@ class UltraEnhancedGAT_Physics(nn.Module):
 
         eattr_s, _ = self._gate_edges(eattr, etype)
 
-        # GAT #1
+        
         x1 = self.gat1(x, ei, edge_attr=eattr_s)
         x1 = F.elu(self.bn1(x1))
         x1 = F.dropout(x1, self.dropout, self.training)
 
-        # GAT #2 + residual projection to match dims
+        
         x2 = self.gat2(x1, ei, edge_attr=eattr_s)
         x2 = F.elu(self.bn2(x2)) + self.skip_proj(x1)
         x2 = F.dropout(x2, self.dropout, self.training)
 
-        # Squeeze–Excitation
+       
         x2 = x2 * self.se(x2)
 
-        # Pools
+        
         mean_pool = global_mean_pool(x2, batch)
         max_pool  = global_max_pool(x2, batch)
 
-        # Graph stream
+      
         g = F.relu(self.lin_graph(gfeat.view(-1, self.lin_graph.in_features)))
 
-        # Fusion
+        
         h = torch.cat([mean_pool, max_pool, g, mean_pool * max_pool], dim=1)
         out = self.final(h)
 
-        # L1 regularizer proxy on gates (mean abs of σ(logit))
+        
         self._gate_l1 = torch.mean(torch.abs(torch.sigmoid(self.edge_type_logit)))
         return out
 
-# ---------- 8) training (with timing) ----------
+
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 model = UltraEnhancedGAT_Physics(
     node_in=node_dim,
@@ -394,20 +391,23 @@ total_train_s = time.perf_counter() - train_start
 avg_epoch_s = np.mean(epoch_times) if epoch_times else float('nan')
 print(f"\nTraining time: {total_train_s:.2f}s total | {avg_epoch_s:.2f}s/epoch (avg over {len(epoch_times)} epochs)")
 
-# load best
+
 model.load_state_dict({k: v.to(device) for k, v in best_state.items()})
 
-# ---------- 9) final evaluation + inference timing ----------
+
+bn_layers = [m for m in model.modules() if isinstance(m, nn.BatchNorm1d)]
+
+
 @torch.no_grad()
 def timed_inference(loader):
     model.eval()
-    # warm-up (especially for GPU)
+    
     for _ in range(2):
         for data in loader:
             data = data.to(device)
             _ = model(data)
         break
-    # timed pass
+    
     n_graphs = 0
     t0 = time.perf_counter()
     for data in loader:
@@ -427,11 +427,87 @@ rmse = np.sqrt(mean_squared_error(trues_phys.flatten(), pred_phys.flatten()))
 mae  = mean_absolute_error(trues_phys.flatten(), pred_phys.flatten())
 r2   = r2_score(trues_phys.flatten(), pred_phys.flatten())
 
+
+rel_rmse = rmse / np.mean(np.abs(trues_phys.flatten()))
+
 throughput = n_eval / infer_s if infer_s > 0 else float('inf')
 per_graph_ms = 1000.0 * infer_s / n_eval if n_eval > 0 else float('nan')
 
-print(f"\nTest RMSE: {rmse:.6f} eV | Test MAE: {mae:.6f} eV | Test R²: {r2:.6f}")
+print(f"\nTest RMSE: {rmse:.6f} eV | Test MAE: {mae:.6f} eV | Test R²: {r2:.6f} | Relative RMSE: {rel_rmse:.6f}")
 print(f"Inference: {infer_s:.3f}s over {n_eval} graphs | ~{throughput:.1f} graphs/s | ~{per_graph_ms:.2f} ms/graph")
+
+
+
+@torch.no_grad()
+def mc_dropout_predictions(loader, T=50):
+    """
+    Run T stochastic forward passes with dropout active to estimate
+    per-sample mean prediction and 1σ uncertainty.
+    """
+    all_samples = []
+    trues_std = None
+
+    for t in range(T):
+        # Enable dropout but keep BatchNorm in eval mode
+        model.train()
+        for bn in bn_layers:
+            bn.eval()
+
+        preds_t = []
+        trues_t = []
+        for data in loader:
+            data = data.to(device)
+            out = model(data).squeeze()
+            preds_t.append(out.detach().cpu().numpy().reshape(-1, 1))
+            trues_t.append(data.y.detach().cpu().numpy().reshape(-1, 1))
+
+        preds_t = np.vstack(preds_t)
+        if trues_std is None:
+            trues_std = np.vstack(trues_t)
+
+        all_samples.append(preds_t)
+
+    
+    model.eval()
+    samples = np.stack(all_samples, axis=0)  # (T, N, 1)
+    return samples, trues_std
+
+
+T_MC = 50  # number of stochastic passes
+mc_samples_std, trues_std = mc_dropout_predictions(test_loader, T=T_MC)
+
+
+mean_std = mc_samples_std.mean(axis=0)          # (N, 1)
+std_std  = mc_samples_std.std(axis=0, ddof=0)   # (N, 1)
+
+
+trues_phys_u       = scaler_y.inverse_transform(trues_std)
+pred_phys_mean_u   = scaler_y.inverse_transform(mean_std)
+pred_phys_std_u    = std_std * scaler_y.scale_[0]  # linear scaling from standardization
+
+abs_errors = np.abs(trues_phys_u.flatten() - pred_phys_mean_u.flatten())
+uncert     = pred_phys_std_u.flatten()
+
+mean_unc   = uncert.mean()
+median_unc = np.median(uncert)
+coverage_1sigma = np.mean(abs_errors <= uncert)
+coverage_2sigma = np.mean(abs_errors <= 2.0 * uncert)
+
+print("\n=== Uncertainty metrics (GAT, MC dropout) ===")
+print(f"Mean predicted 1σ uncertainty: {mean_unc:.4f} eV")
+print(f"Median predicted 1σ uncertainty: {median_unc:.4f} eV")
+print(f"Fraction of test points within ±1σ: {coverage_1sigma:.3f}")
+print(f"Fraction of test points within ±2σ: {coverage_2sigma:.3f}")
+
+
+uncert_df = pd.DataFrame({
+    'True_VFE_eV': trues_phys_u.flatten(),
+    'Pred_VFE_MC_Mean_eV': pred_phys_mean_u.flatten(),
+    'Pred_VFE_MC_Std1_eV': uncert,
+    'Abs_Error_eV': abs_errors
+})
+uncert_df.to_csv('gat_mc_dropout_uncertainty_results.csv', index=False)
+print("\nSaved MC-dropout uncertainty results to 'gat_mc_dropout_uncertainty_results.csv'.")
 
 if TOTAL_DFT_CPU_HOURS is not None:
     dft_seconds = TOTAL_DFT_CPU_HOURS * 3600.0
@@ -442,10 +518,47 @@ if TOTAL_DFT_CPU_HOURS is not None:
     print(f"  vs. train + evaluation: ~{speedup_train_plus_eval:,.0f}×")
     print("  (Set TOTAL_DFT_CPU_HOURS to your workflow’s CPU-hour estimate.)")
 
-plt.figure(figsize=(6,6))
-plt.scatter(trues_phys.flatten(), pred_phys.flatten(), alpha=0.6, edgecolor='k', linewidth=0.4)
+
+fig, ax = plt.subplots(figsize=(8, 8), dpi=300)
+
+
+ax.scatter(
+    trues_phys.flatten(),
+    pred_phys.flatten(),
+    alpha=0.6,
+    edgecolor='k',
+    linewidth=0.4,
+    label='Predicted'
+)
 mn, mx = trues_phys.min(), trues_phys.max()
-plt.plot([mn, mx], [mn, mx], 'r--', linewidth=1.2)
-plt.xlabel('Actual VFE (eV)'); plt.ylabel('Predicted VFE (eV)')
-plt.title('UltraEnhancedGAT (2-layer, undirected pairs, host@graph, no pure-VFE input)')
-plt.grid(True, ls='--', alpha=0.5); plt.tight_layout(); plt.show()
+ax.plot([mn, mx], [mn, mx], 'r--', linewidth=1.2, label='Parity')
+
+
+ax.set_xlabel('Actual VFE (eV)', fontsize=24)
+ax.set_ylabel('Predicted VFE (eV)', fontsize=24)
+
+
+ax.tick_params(axis='both', labelsize=20)
+
+
+ax.legend(fontsize=20, loc='upper left', markerscale=1.3)
+
+
+ax.grid(False)
+
+
+ax.text(
+    0.95, 0.05,
+    rf'$R^2 = {r2:.3f}$',
+    transform=ax.transAxes,
+    ha='right', va='bottom',
+    fontsize=20,
+    bbox=dict(facecolor='white', edgecolor='black',
+              boxstyle='round', alpha=0.9)
+)
+
+fig.tight_layout()
+
+fig.savefig('gat_parity_plot.png', dpi=300, bbox_inches='tight')
+
+plt.show()
