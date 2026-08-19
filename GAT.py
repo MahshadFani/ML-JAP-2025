@@ -9,7 +9,6 @@ from sklearn.preprocessing import StandardScaler
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import r2_score, mean_squared_error, mean_absolute_error  # <-- added
 
-
 USE_GRAPH_PHYSICS_TERMS = True  # set True to append [delta_size, delta_chi] to graph-level features
 
 TOTAL_DFT_CPU_HOURS = None  # e.g., 750.0
