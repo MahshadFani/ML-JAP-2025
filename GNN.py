@@ -515,7 +515,6 @@ ax.scatter(
 mn, mx = trues_phys.min(), trues_phys.max()
 ax.plot([mn, mx], [mn, mx], 'r--', linewidth=1.2, label='Parity')
 
-
 ax.set_xlabel('Actual VFE (eV)', fontsize=24)
 ax.set_ylabel('Predicted VFE (eV)', fontsize=24)
 
